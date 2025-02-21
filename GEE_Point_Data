@@ -1,0 +1,142 @@
+import ee
+from datetime import datetime, timezone
+import pandas as pd
+
+# Initialise Earth Engine
+ee.Initialize()
+
+# ------------------------------------------------------------
+# 1. Define parameters and region of interest
+# ------------------------------------------------------------
+BANDS = [
+    'B1', 'B2', 'B3', 'B4', 'B5', 'B6', 
+    'B7', 'B8', 'B8A', 'B11', 'B12',  # Sentinel-2 bands
+    'SCL', 'MSK_CLDPRB', 'MSK_SNWPRB',  # Quality and scene bands
+    'cs', 'cs_cdf'                     # Cloud score bands
+]
+
+# Coordinates of the point (Lake Opuha sensor location)
+poi_lat = -43.998830437515075
+poi_lon = 170.8910366463427
+radius = 20  # in metres
+
+# Create a small buffer around the point and take its bounding box.
+initial_point = ee.Geometry.Point([poi_lon, poi_lat])
+region_of_interest = initial_point.buffer(radius).bounds()
+
+# Temporal range
+start_date = '2021-02-05'
+end_date = datetime.now().strftime('%Y-%m-%d')  # current date
+
+# Output path for CSV
+output_filename = f'S2_{end_date}_{radius}M_Median_.csv'
+output_path = f'processed_Data/{output_filename}'
+
+# ------------------------------------------------------------
+# 2. Load and filter Earth Engine collections
+# ------------------------------------------------------------
+s2_collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED') \
+    .filterDate(start_date, end_date) \
+    .filterBounds(region_of_interest)
+
+cloud_scores = ee.ImageCollection('GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED') \
+    .filterDate(start_date, end_date) \
+    .filterBounds(region_of_interest)
+
+# Link cloud scores to Sentinel-2 images
+merged_collection = s2_collection.linkCollection(
+    cloud_scores, 
+    linkedBands=['cs', 'cs_cdf']
+)
+
+# ------------------------------------------------------------
+# 3. Define helper function to attach metadata
+# ------------------------------------------------------------
+def extract_metadata(image):
+    """
+    Attach key metadata fields to the image.
+    """
+    metadata = image.toDictionary().combine({
+        'sun_zenith': image.get('MEAN_SOLAR_ZENITH_ANGLE'),
+        'sun_azimuth': image.get('MEAN_SOLAR_AZIMUTH_ANGLE'),
+        'processing_baseline': image.get('PROCESSING_BASELINE'),
+        'product_id': image.get('PRODUCT_ID'),
+        'cloud_coverage': image.get('CLOUD_COVERAGE_ASSESSMENT')
+    })
+    return image.set(metadata)
+
+merged_collection = merged_collection.map(extract_metadata)
+
+# ------------------------------------------------------------
+# 4. Define sampling function: median reducer
+# ------------------------------------------------------------
+scale = 10  # Sentinel-2 resolution is approximately 10 m
+
+def sample_image(image):
+    sample = image.reduceRegion(
+        reducer=ee.Reducer.median(),
+        geometry=region_of_interest,
+        scale=scale,
+        bestEffort=True
+    )
+    metadata = image.toDictionary(image.propertyNames())
+    return ee.Feature(None, metadata.combine(sample))
+
+# Get sampled features from the collection
+features_info = merged_collection.map(sample_image).getInfo().get('features', [])
+
+# ------------------------------------------------------------
+# 5. Convert Earth Engine features to a pandas DataFrame
+# ------------------------------------------------------------
+records = []
+for feature in features_info:
+    props = feature.get('properties', {})
+    epoch_time = props.get('system:time_start')
+    if epoch_time is None:
+        continue
+
+    # Convert epoch time (milliseconds) to UTC datetime
+    dt_utc = datetime.fromtimestamp(epoch_time / 1000.0, tz=timezone.utc)
+
+    # Construct a record with metadata
+    record = {
+        'Timestamp (UTC)': dt_utc.strftime('%Y-%m-%d %H:%M:%S'),
+        'sun_zenith': props.get('sun_zenith'),
+        'sun_azimuth': props.get('sun_azimuth'),
+        'processing_baseline': props.get('processing_baseline'),
+        'product_id': props.get('product_id'),
+        'cloud_coverage': props.get('cloud_coverage')
+    }
+    
+    # Add band values
+    for band in BANDS:
+        record[band] = props.get(band)
+    
+    # Compute quality mask:
+    # The quality_mask is set to 1 only if:
+    #  - MSK_CLDPRB is less than 30,
+    #  - SCL equals 6, and
+    #  - cs score is greater than 0.8.
+    msk_cldprb = props.get('MSK_CLDPRB')
+    scl = props.get('SCL')
+    cs = props.get('cs')
+
+    records.append(record)
+
+df_s2 = pd.DataFrame(records)
+
+# ------------------------------------------------------------
+# 6. Additional processing and saving
+# ------------------------------------------------------------
+# Convert the 'Timestamp (UTC)' column to datetime and create a daily date column
+df_s2['Timestamp (UTC)'] = pd.to_datetime(df_s2['Timestamp (UTC)'], utc=True)
+df_s2['Date'] = df_s2['Timestamp (UTC)'].dt.date
+
+
+
+# Export the DataFrame to CSV
+df_s2.to_csv(output_path, index=False)
+print(f"Data saved to: {output_path}")
+
+# Show a preview of the first 10 rows
+df_s2.head(10)
